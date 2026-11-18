@@ -1,0 +1,10 @@
+qi,name,short_name,title
+QI01,ventilation,ventilation,Lung-protective ventilation in Acute Respiratory Distress Syndrome (ARDS)
+QI02,weaning,weaning,Weaning from mechanical ventilation
+QI03,feeding,feeding,Early enteral nutrition and calorie target met
+QI04,glucose control,glucose,Maintaining appropriate glucose levels
+QI05,thromboembolic prevention,VTE prevention,Prevention of venous thromboembolism
+QI06,infection rate,infection,Infection rate pneumonia + catheters
+QI07,"pain, sedation, delirium",pain/sedation,"Pain, Sedation and Delirium"
+QI08,advance care plan,care plan,Advance care plan
+QI09,mobilisation,mobilisation,Early mobilisation

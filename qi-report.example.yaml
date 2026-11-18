@@ -1,0 +1,46 @@
+# Example configuration for qi_report.py — copy and adapt.
+# Relative paths are resolved against the directory of this file.
+#
+# A file may list CSV datasets, database datasets, or both; --source csv|db
+# selects which list is used (default: the only one present, else csv).
+#
+# Quote values that YAML would otherwise read as numbers, booleans or null,
+# e.g. a schema named "2024", "yes" or "null".
+
+# QI result concepts (default: qi-result-concepts.csv next to qi_report.py)
+# result_concepts: qi-result-concepts.csv
+# QI debug concepts (default: qi-debug-concepts.csv next to qi_report.py)
+# debug_concepts: qi-debug-concepts.csv
+# QI names and titles (default: qi-definitions.csv next to qi_report.py)
+# qi_definitions: qi-definitions.csv
+
+server:
+  host: 127.0.0.1
+  port: 8000
+
+# --source csv: dataset name: path of a results CSV written by the CQL engine.
+# The run log and the profile (flamegraph) are looked up as log-<dataset>.txt and
+# profile-<dataset>.svg next to results-<dataset>.csv[.gz]; write
+# NAME: {path: ..., log: ..., profile: ...} to give them explicitly.
+csv:
+  datasets:
+    sicdb:  /home/user/Downloads/results-sicdb.csv.gz
+    mimic:  /home/user/Downloads/results-mimic.csv.gz
+    eicu:   /home/user/Downloads/results-eicu.csv.gz
+    aumcdb: /home/user/Downloads/results-aumcdb.csv.gz
+    hirid:  /home/user/Downloads/results-hirid.csv.gz
+
+# --source db: OMOP CDM databases holding the same rows in <schema>.observation.
+# The DSN is a PostgreSQL URL or libpq "key=value" string; ${VARIABLES} are
+# expanded from the environment (libpq's PGPASSWORD and ~/.pgpass work too).
+db:
+  dsn: postgresql://qi_reader@db.example.org:5432/appdb
+  datasets:
+    mimic: mimic                                       # dataset name: schema name
+    eicu:                                              # with a run log and profile
+      schema: eicu                                     # (both optional)
+      log: /home/user/Downloads/log-eicu.txt
+      profile: /home/user/Downloads/profile-eicu.svg
+    aumcdb:
+      schema: cdm_54
+      dsn: postgresql://qi_reader@db.example.org:5432/aumcdb
