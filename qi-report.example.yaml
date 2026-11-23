@@ -7,11 +7,11 @@
 # Quote values that YAML would otherwise read as numbers, booleans or null,
 # e.g. a schema named "2024", "yes" or "null".
 
-# QI result concepts (default: qi-result-concepts.csv next to qi_report.py)
+# QI result concepts (default: qi-result-concepts.csv in data/ next to qi_report.py)
 # result_concepts: qi-result-concepts.csv
-# QI debug concepts (default: qi-debug-concepts.csv next to qi_report.py)
+# QI debug concepts (default: qi-debug-concepts.csv in data/ next to qi_report.py)
 # debug_concepts: qi-debug-concepts.csv
-# QI names and titles (default: qi-definitions.csv next to qi_report.py)
+# QI names and titles (default: qi-definitions.csv in data/ next to qi_report.py)
 # qi_definitions: qi-definitions.csv
 
 server:

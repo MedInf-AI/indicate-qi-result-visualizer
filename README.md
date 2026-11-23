@@ -14,6 +14,7 @@ The dependencies are [DuckDB](https://duckdb.org/) and
 installed:
 
 ```sh
+uv run qi_report.py                               # the result bundles in results/ (see below)
 uv run qi_report.py results-mimic.csv            # a single set of results
 uv run qi_report.py results/                      # every results-*.csv[.gz] in a directory
 uv run qi_report.py --source db --dsn postgresql://user@host/qi my_schema
@@ -21,11 +22,73 @@ uv run qi_report.py --config qi-report.yaml --source db
 ```
 
 (Or `pip install duckdb pyyaml` and run `python qi_report.py …`.) Then open
-<http://127.0.0.1:8000/>. Options: `--host`, `--port`, `--result-concepts FILE`,
-`--debug-concepts FILE`, `--qi-definitions FILE`, `-v` (log requests); see `--help`.
+<http://127.0.0.1:8000/>. Options: `--host`, `--port`, `--results-dir DIR`,
+`--result-concepts FILE`, `--debug-concepts FILE`, `--qi-definitions FILE`, `-v` (log
+requests); see `--help`.
 
 Dataset names default to the file name without `results-` and `.csv`, or to the
 schema name; write `NAME=VALUE` to choose one, e.g. `site-a=export.csv`.
+
+## Result bundles
+
+Without `INPUT` arguments or `--config`, the report shows **result bundles**: the
+results, run logs and profiles of one evaluation of all datasets, kept in one
+directory per date below `results/` (relative to the working directory;
+`--results-dir DIR` picks another):
+
+```
+results/
+  2026-11-10/  results-mimic.csv.gz  log-mimic.txt  profile-mimic.svg  …
+  2026-11-18/  results-mimic.csv.gz  log-mimic.txt  profile-mimic.svg  …
+```
+
+The newest bundle is shown at `/`; the selector at the top of the sidebar shows
+another one (at `/bundle/<date>/`, on the same page if that bundle has it). Bundles
+are loaded when first shown and then kept in memory; the directory is re-read on
+every request, so bundle directories copied in by hand show up too.
+
+**Uploading:** the sidebar's upload form takes an archive named
+`results-bundle-YYYY-MM-DD.tar.gz` (or `.tgz`, `.tar`) and unpacks it into
+`results/YYYY-MM-DD/`. Only `results-*.csv[.gz]`, `log-*.txt` and `profile-*.svg`
+files are taken, by their base name (directories in the archive are ignored);
+anything else is skipped and listed. Uploading a bundle for a date that is there
+already asks before replacing it. The same can be done from the command line:
+
+```sh
+curl --data-binary @results-bundle-2026-11-18.tar.gz \
+  'http://127.0.0.1:8000/upload?name=results-bundle-2026-11-18.tar.gz'   # &replace=1
+```
+
+**Changes since an older bundle:** each bundle is compared with the one before
+it by date, unless another is chosen in the sidebar's **Compared with** selector:
+any older bundle, or nothing. The choice is part of the address
+(`/bundle/<date>/vs/<older date>/`, or `/vs/none/`) and is kept while moving
+between pages, and while switching to another bundle as long as it is still
+older. The bundle compared with is loaded as well. Changes are marked with a small
+purple marker next to the value (e.g. `+1,234 (+3.2%)`, `-1.5 pp` for adherence,
+`new`); hover it for the value before. Two values count as different when they are
+shown differently, so rounding noise is not a change. Shown are:
+
+* on the overview, a **Changes since …** section summarizing every dataset (new,
+  gone, unchanged, or what changed), and markers in the comparison and dataset
+  tables;
+* on a dataset page, a collapsed **Changes since …** section (its heading says
+  how many values changed; links to it open it) with a table of everything that
+  changed — rows and dates, run time, patients, failures and warnings, each kind
+  of warning, and per QI the patient-days, mean adherence, periods and debug
+  values (one row each, with columns for n and the mean) — plus markers on the
+  run tiles, the warnings table and each QI's totals;
+* in the charts (on dataset and QI pages), the preceding bundle's values drawn
+  faintly in the colour of changes: adherence and debug values (mean and
+  interquartile range) behind the current ones, the initial population as
+  outlined bars over the current ones (so that both higher and lower counts show);
+  hovering a period shows both. This needs the same kind of periods
+  (week/month/year) in both bundles;
+* on a QI page, markers in the summary table and each dataset's totals.
+
+Kinds of warnings are matched across runs by level and message with the numbers
+blanked out, since the message is an example whose ids and values vary. Run
+totals are only compared when both run logs are complete.
 
 ## Data sources
 
@@ -91,7 +154,8 @@ last progress reported. Logs and profiles are re-read with **Reload data**.
 
 ## Concepts files
 
-Two files decide which concept ids are shown and supply their names:
+Two files decide which concept ids are shown and supply their names (by default,
+they and the QI definitions file below are read from `data/` next to `qi_report.py`):
 
 * **`qi-result-concepts.csv`**: the QI result concepts, one row each, with the
   columns `qi`, `concept_id` and `concept_name`.
@@ -126,6 +190,8 @@ If a concept is in both files, the debug concepts file wins.
 * **Several datasets:** an overview with a cross-dataset comparison table, a
   page per dataset (all QIs), and a page per QI (all datasets).
 * **One dataset:** just the dataset page.
+* **Result bundles:** the same, for the bundle selected, with its changes since
+  the preceding bundle (see [Result bundles](#result-bundles)).
 
 The sidebar lists the pages and the sections of the current one, highlighting
 the section in view. Each QI shows the initial population and the adherence per
@@ -138,5 +204,6 @@ dates (MIMIC-style shifted dates spanning decades get coarser periods).
 
 Data is loaded once at startup (the page shows progress until done) and kept
 in memory as aggregates; **Reload data** in the sidebar re-reads it in the
-background while the previous data stays visible. A 430 MB results CSV loads
+background while the previous data stays visible (for a result bundle, the
+bundle shown and the one it is compared with). A 430 MB results CSV loads
 in about a second.

@@ -35,6 +35,12 @@ The QI result rows carry no patient identity, so every number is a count of
 QI's initial population criterion held — and ``value_as_number`` is that
 day's adherence ratio (numerator / denominator).
 
+Without datasets on the command line or a configuration file, the report shows
+the *result bundles* of a directory (``results/``): one ``<YYYY-MM-DD>/``
+directory of results, run logs and profiles per evaluation, which can be uploaded
+as ``results-bundle-<YYYY-MM-DD>.tar.gz`` archives. Each bundle is shown with
+its changes since an older one: the preceding one, or any other that is chosen.
+
 Data is loaded once at startup (in the background; the server answers right
 away) and on demand via the "Reload data" button. Run with ``--help`` for
 usage; see README.md for the configuration file.
@@ -47,11 +53,15 @@ import argparse
 import contextlib
 import csv
 import html
+import json
 import logging
 import math
 import os
 import re
+import shutil
 import sys
+import tarfile
+import tempfile
 import threading
 import time
 import traceback
@@ -61,8 +71,8 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
-from urllib.parse import quote, unquote, urlsplit
+from pathlib import Path, PurePosixPath
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 import duckdb
 import yaml
@@ -103,6 +113,14 @@ DEFAULT_RESULT_CONCEPTS = DATA_DIR / "qi-result-concepts.csv"
 DEFAULT_DEBUG_CONCEPTS = DATA_DIR / "qi-debug-concepts.csv"
 DEFAULT_QI_DEFINITIONS = DATA_DIR / "qi-definitions.csv"
 
+#: where result bundles are kept when no datasets are given (relative to the working directory)
+DEFAULT_RESULTS_DIR = Path("results")
+#: file name of an uploaded result bundle; its date names the bundle's directory
+BUNDLE_ARCHIVE = re.compile(r"results-bundle-(\d{4}-\d\d-\d\d)\.(?:tar\.gz|tgz|tar)")
+#: name of a bundle directory below the results directory
+BUNDLE_DIR = re.compile(r"\d{4}-\d\d-\d\d")
+#: files taken from an uploaded bundle (by base name); all others are skipped
+BUNDLE_MEMBER = re.compile(r"(?:results-[\w.-]+\.csv(?:\.gz)?|log-[\w.-]+\.txt|profile-[\w.-]+\.svg)")
 
 #: required columns of the result and debug concepts files
 CONCEPT_COLUMNS = ("qi", "concept_id", "concept_name")
@@ -143,9 +161,11 @@ class Settings:
     result_concepts: Path
     debug_concepts: Path | None  # None: the default file, which may be missing
     qi_definitions: Path | None  # None: the default file, which may be missing
-    datasets: list[DatasetSpec]
+    datasets: list[DatasetSpec]  # empty in bundle mode
     host: str
     port: int
+    #: bundle mode: the directory holding one ``<YYYY-MM-DD>/`` directory per result bundle
+    results_dir: Path | None = None
 
 
 def _redact_dsn(dsn: str) -> str:
@@ -209,6 +229,12 @@ def _csv_specs_from_args(inputs: list[str]) -> list[DatasetSpec]:
         else:
             specs.append(_csv_spec(name or _dataset_name_from_path(path), path))
     return specs
+
+
+def _bundle_specs(directory: Path) -> list[DatasetSpec]:
+    """The datasets of a result bundle: every results file in its directory."""
+    found = sorted([*directory.glob("results-*.csv"), *directory.glob("results-*.csv.gz")])
+    return [_csv_spec(_dataset_name_from_path(p), p) for p in found]
 
 
 def _db_specs_from_args(inputs: list[str], dsn: str | None) -> list[DatasetSpec]:
@@ -295,6 +321,7 @@ def parse_args(argv: list[str] | None = None) -> Settings:
         description="Serve a report of QI results (initial population and adherence "
                     "per period) and QI debug values over HTTP.",
         epilog="examples:\n"
+               "  %(prog)s                               (result bundles in ./results/)\n"
                "  %(prog)s results-mimic.csv\n"
                "  %(prog)s results/                      (all results-*.csv[.gz] in a directory)\n"
                "  %(prog)s --source db --dsn postgresql://user@host/qi mimic eicu\n"
@@ -305,6 +332,10 @@ def parse_args(argv: list[str] | None = None) -> Settings:
                    help="csv: results files (may be gzipped) or directories (results-*.csv[.gz]); db: schema "
                         "names. Either may be written NAME=VALUE to set the dataset name. "
                         "Overrides the datasets of the configuration file.")
+    p.add_argument("-r", "--results-dir", type=Path,
+                   help="directory of result bundles, one <YYYY-MM-DD>/ directory each, to which "
+                        "bundles can be uploaded (default, and used only, when neither INPUT "
+                        f"nor --config is given: {DEFAULT_RESULTS_DIR}/)")
     p.add_argument("-c", "--config", type=Path,
                    help="YAML configuration file listing datasets (see README.md)")
     p.add_argument("-s", "--source", choices=["csv", "db"],
@@ -315,13 +346,13 @@ def parse_args(argv: list[str] | None = None) -> Settings:
                                  "environment variables like ${PGPASS} are expanded")
     p.add_argument("--result-concepts", type=Path,
                    help=f"QI result concepts file (default: config 'result_concepts', else "
-                        f"{DEFAULT_RESULT_CONCEPTS.name} next to this script)")
+                        f"{DEFAULT_RESULT_CONCEPTS.name} in data/ next to this script)")
     p.add_argument("--debug-concepts", type=Path,
                    help="debug concepts file (default: config 'debug_concepts', else "
-                        f"{DEFAULT_DEBUG_CONCEPTS.name} next to this script)")
+                        f"{DEFAULT_DEBUG_CONCEPTS.name} in data/ next to this script)")
     p.add_argument("--qi-definitions", type=Path,
                    help="QI names and titles file (default: config 'qi_definitions', else "
-                        f"{DEFAULT_QI_DEFINITIONS.name} next to this script)")
+                        f"{DEFAULT_QI_DEFINITIONS.name} in data/ next to this script)")
     p.add_argument("--host", default=None, help="address to listen on (default 127.0.0.1)")
     p.add_argument("--port", type=int, default=None, help="port to listen on (default 8000)")
     p.add_argument("-v", "--verbose", action="store_true", help="log every HTTP request")
@@ -339,7 +370,17 @@ def parse_args(argv: list[str] | None = None) -> Settings:
         source = configured[0] if len(configured) == 1 else "csv"
 
     dsn = os.path.expandvars(args.dsn) if args.dsn else None
-    if args.inputs:
+    results_dir = None
+    if args.results_dir or not (args.inputs or args.config):
+        if args.inputs or args.config:
+            p.error("--results-dir cannot be combined with INPUT or --config")
+        if args.source == "db":
+            p.error("result bundles hold CSV files; --source db needs INPUT or --config")
+        results_dir = (args.results_dir or DEFAULT_RESULTS_DIR).resolve()
+        if results_dir.exists() and not results_dir.is_dir():
+            raise SystemExit(f"error: {results_dir} is not a directory")
+        specs = []
+    elif args.inputs:
         if source == "csv":
             specs = _csv_specs_from_args(args.inputs)
         else:
@@ -348,7 +389,7 @@ def parse_args(argv: list[str] | None = None) -> Settings:
                                         dsn or (os.path.expandvars(cfg_dsn) if cfg_dsn else None))
     else:
         specs = _specs_from_config(cfg, source, base, dsn)
-    if not specs:
+    if not specs and results_dir is None:
         other = "db" if source == "csv" else "csv"
         hint = (f" (the configuration file has {other}.datasets — use --source {other}?)"
                 if cfg.get(other, {}).get("datasets") else "")
@@ -382,7 +423,7 @@ def parse_args(argv: list[str] | None = None) -> Settings:
     return Settings(source=source, result_concepts=result_concepts, debug_concepts=debug_concepts,
                     qi_definitions=qi_definitions, datasets=specs,
                     host=args.host or server.get("host", "127.0.0.1"),
-                    port=args.port or int(server.get("port", 8000)))
+                    port=args.port or int(server.get("port", 8000)), results_dir=results_dir)
 
 
 # ==========================================================================
@@ -863,11 +904,17 @@ class _Attachments:
         return alias
 
 
+#: one load at a time, so that loading several bundles does not multiply memory use
+_LOAD_LOCK = threading.Lock()
+
+
 class DataStore:
     """Holds the aggregated data of all datasets; (re)loads it in a background thread."""
 
-    def __init__(self, specs: list[DatasetSpec]):
+    def __init__(self, specs: list[DatasetSpec],
+                 rescan: Callable[[], list[DatasetSpec]] | None = None):
         self.specs = specs
+        self._rescan = rescan  # called on every (re)load to find the datasets anew
         self.datasets: list[DatasetData] | None = None
         self.loaded_at: datetime | None = None
         self.progress: str | None = None  # set while a load is running
@@ -887,10 +934,16 @@ class DataStore:
         return True
 
     def _load_all(self) -> None:
-        t0 = time.monotonic()
         results: list[DatasetData] = []
-        con = duckdb.connect(":memory:")
+        if not _LOAD_LOCK.acquire(blocking=False):
+            self.progress = "waiting for another load to finish"
+            _LOAD_LOCK.acquire()
+        t0 = time.monotonic()
+        con = None
         try:
+            if self._rescan is not None:
+                self.specs = self._rescan()
+            con = duckdb.connect(":memory:")
             con.execute("SET preserve_insertion_order = false")
             attachments = _Attachments(con)
             for i, spec in enumerate(self.specs, 1):
@@ -931,12 +984,156 @@ class DataStore:
                         log.warning("profile of %s: %s", spec.name, data.profile.error)
                 results.append(data)
         finally:
-            con.close()
+            if con is not None:
+                con.close()
+            _LOAD_LOCK.release()
             with self._lock:
                 self.datasets = results
                 self.loaded_at = datetime.now().astimezone()
                 self.progress = None
         log.info("all datasets loaded in %.1fs", time.monotonic() - t0)
+
+
+# ==========================================================================
+# Result bundles: one directory of results, logs and profiles per date
+
+
+class BundleError(Exception):
+    """An uploaded result bundle cannot be used; the message is shown to the uploader."""
+
+    def __init__(self, message: str, status: HTTPStatus = HTTPStatus.BAD_REQUEST):
+        super().__init__(message)
+        self.status = status
+
+
+def extract_bundle(archive: Path, dest: Path) -> list[str]:
+    """Copy the results, logs and profiles of a bundle archive into ``dest``.
+
+    Files are taken by base name only (so no member can be written outside
+    ``dest``); directories are ignored and anything else is skipped. Returns the
+    names of the skipped members.
+    """
+    skipped: list[str] = []
+    seen: set[str] = set()
+    try:
+        with tarfile.open(archive, "r:*") as tf:
+            for member in tf:
+                if member.isdir():
+                    continue
+                name = PurePosixPath(member.name).name
+                if not member.isfile() or not BUNDLE_MEMBER.fullmatch(name):
+                    skipped.append(member.name)
+                    continue
+                if name in seen:
+                    raise BundleError(f"the archive holds {name} more than once")
+                seen.add(name)
+                src = tf.extractfile(member)
+                if src is None:
+                    raise BundleError(f"cannot read {member.name} from the archive")
+                with src, (dest / name).open("xb") as out:
+                    shutil.copyfileobj(src, out, 1 << 20)
+                os.utime(dest / name, (member.mtime, member.mtime))
+    except tarfile.ReadError as e:
+        raise BundleError("not a tar archive (optionally gzipped)") from e
+    except (tarfile.TarError, EOFError, OSError) as e:
+        raise BundleError(f"cannot read the archive: {e}") from e
+    if not any(n.startswith("results-") for n in seen):
+        raise BundleError("the archive holds no results-*.csv[.gz] files")
+    return skipped
+
+
+class Library:
+    """The result bundles in a results directory (``<YYYY-MM-DD>/`` each), loaded on demand.
+
+    Loaded bundles stay in memory: their aggregates are small.
+    """
+
+    def __init__(self, root: Path):
+        self.root = root
+        self._stores: dict[str, DataStore] = {}
+        self._lock = threading.Lock()
+
+    def dates(self) -> list[str]:
+        """The bundles present, oldest first (re-read every time: bundles may be copied in)."""
+        try:
+            entries = list(self.root.iterdir())
+        except FileNotFoundError:
+            return []
+        out = []
+        for e in entries:
+            if BUNDLE_DIR.fullmatch(e.name) and e.is_dir():
+                try:
+                    date.fromisoformat(e.name)
+                except ValueError:
+                    continue
+                out.append(e.name)
+        return sorted(out)
+
+    @staticmethod
+    def previous(key: str, dates: list[str]) -> str | None:
+        """The bundle preceding ``key`` by date, if any."""
+        older = [d for d in dates if d < key]
+        return older[-1] if older else None
+
+    def store(self, key: str) -> DataStore:
+        """The data of bundle ``key``; starts loading it on first use."""
+        with self._lock:
+            st = self._stores.get(key)
+            if st is None:
+                directory = self.root / key
+                st = self._stores[key] = DataStore([], lambda: _bundle_specs(directory))
+                st.reload()
+            return st
+
+    def add(self, filename: str, body, length: int, replace: bool) -> tuple[str, list[str]]:
+        """Store an uploaded bundle archive (``length`` bytes read from ``body``) as
+        ``<results dir>/<date>/``; returns the date and the skipped archive members."""
+        self.root.mkdir(parents=True, exist_ok=True)
+        archive = extracted = replaced = None
+        try:
+            # read the whole upload first, so that the client gets to see an error reply
+            with tempfile.NamedTemporaryFile(dir=self.root, prefix=".upload-",
+                                             delete=False) as f:
+                archive = Path(f.name)
+                remaining = length
+                while remaining > 0:
+                    chunk = body.read(min(1 << 20, remaining))
+                    if not chunk:
+                        raise BundleError("the upload ended prematurely")
+                    f.write(chunk)
+                    remaining -= len(chunk)
+            m = BUNDLE_ARCHIVE.fullmatch(filename)
+            if not m:
+                raise BundleError(f"{filename!r} is not named results-bundle-YYYY-MM-DD.tar.gz")
+            key = m[1]
+            try:
+                date.fromisoformat(key)
+            except ValueError:
+                raise BundleError(f"{key} in {filename!r} is not a valid date") from None
+            target = self.root / key
+            if target.exists() and not replace:
+                raise BundleError(f"there is a bundle for {key} already", HTTPStatus.CONFLICT)
+            extracted = Path(tempfile.mkdtemp(dir=self.root, prefix=".extract-"))
+            extracted.chmod(0o755)
+            skipped = extract_bundle(archive, extracted)
+            with self._lock:
+                if target.exists():
+                    if not replace:
+                        raise BundleError(f"there is a bundle for {key} already",
+                                          HTTPStatus.CONFLICT)
+                    replaced = target.rename(extracted.with_name(f".replaced-{key}-{time.time_ns()}"))
+                extracted.rename(target)
+                extracted = None
+                self._stores.pop(key, None)  # loaded again when next shown
+        finally:
+            if archive is not None:
+                archive.unlink(missing_ok=True)
+            for d in (extracted, replaced):
+                if d is not None:
+                    shutil.rmtree(d, ignore_errors=True)
+        log.info("stored result bundle %s from %s (%d member(s) skipped)", key, filename,
+                 len(skipped))
+        return key, skipped
 
 
 # ==========================================================================
@@ -1136,14 +1333,24 @@ def _hit(axis: TimeAxis, b: Bucket, tip: str) -> str:
 
 
 def bars_panel(axis: TimeAxis, label: str, note: str, buckets: list[Bucket],
-               show_x: bool) -> str:
-    ticks = nice_ticks(0, max([b.n for b in buckets] + [1]))
+               show_x: bool, prev: list[Bucket] | None = None, prev_key: str = "") -> str:
+    """A bar chart of the counts per period.
+
+    ``prev`` (the same series in the bundle of ``prev_key``, on the same kind of
+    periods) is drawn as faint outlined bars in the colour of changes, over the
+    current ones so that it shows whether it is higher or lower.
+    """
+    ticks = nice_ticks(0, max([b.n for b in buckets + (prev or [])] + [1]))
     marks, hits = [], []
-    for b in buckets:
+
+    def bar_box(b: Bucket) -> tuple[float, float, float, float]:
         a, z = axis.span(b.start)
         w = min(24.0, max(1.0, z - a - 2))  # 2px gap between neighbours, <= 24px
-        x = (a + z) / 2 - w / 2
-        top, bottom = _y(b.n, ticks), _y(0, ticks)
+        return (a + z) / 2 - w / 2, w, _y(b.n, ticks), _y(0, ticks)
+
+    before = {b.start: b for b in prev or []}
+    for b in buckets:
+        x, w, top, bottom = bar_box(b)
         h = bottom - top
         r = 4 if w >= 8 and h >= 4 else 0
         if r:
@@ -1153,48 +1360,86 @@ def bars_panel(axis: TimeAxis, label: str, note: str, buckets: list[Bucket],
         elif h > 0:
             marks.append(f'<rect class="bar" x="{x:.1f}" y="{top:.1f}" width="{w:.1f}" '
                          f'height="{h:.1f}"/>')
-        hits.append(_hit(axis, b, f"{fmt_period(b.start, axis.unit)}: "
-                                  f"{b.n:,} patient-days"))
+        tip = f"{fmt_period(b.start, axis.unit)}: {b.n:,} patient-days"
+        if prev is not None:
+            pb = before.pop(b.start, None)
+            tip += f"\n{prev_key}: " + (f"{pb.n:,} patient-days" if pb else "none")
+        hits.append(_hit(axis, b, tip))
+    for pb in before.values():  # periods in the preceding bundle only
+        hits.append(_hit(axis, pb, f"{fmt_period(pb.start, axis.unit)}: none\n"
+                                   f"{prev_key}: {pb.n:,} patient-days"))
+    for pb in prev or []:
+        x, w, top, bottom = bar_box(pb)
+        if bottom - top > 0:
+            marks.append(f'<rect class="bar prev" x="{x:.1f}" y="{top:.1f}" '
+                         f'width="{w:.1f}" height="{bottom - top:.1f}"/>')
     return _panel(axis, label, note, ticks, False, marks, hits, show_x)
 
 
-def line_panel(axis: TimeAxis, label: str, note: str, buckets: list[Bucket], band: bool,
-               pct: bool, show_x: bool, info: str = "", unit: str = "") -> str:
-    pts = [b for b in buckets if b.mean is not None]
-    if not pts:
-        return ""
-    lows = [b.q25 if band and b.q25 is not None else b.mean for b in pts]
-    highs = [b.q75 if band and b.q75 is not None else b.mean for b in pts]
-    lo, hi = min(lows), max(highs)
-    if pct:
-        lo, hi = min(0.0, lo), max(1.0, hi)
-    ticks = nice_ticks(lo, hi)
-    marks, hits = [], []
-    for run in _runs(axis, pts):
+def _line_marks(axis: TimeAxis, pts: list[Bucket], ticks: list[float], band: bool,
+                cls: str = "", dot_r: float | None = None) -> list[str]:
+    """Band (interquartile range), line and dots of a series; ``cls`` is added to each
+    mark's class. Dots get radius ``dot_r`` (default: by the number of points)."""
+    marks = []
+    runs = _runs(axis, pts)
+    for run in runs:
         if band:
             upper = " ".join(f"{axis.mid(b.start):.1f},{_y(_hi(b), ticks):.1f}" for b in run)
             lower = " ".join(f"{axis.mid(b.start):.1f},{_y(_lo(b), ticks):.1f}"
                              for b in reversed(run))
-            marks.append(f'<polygon class="band" points="{upper} {lower}"/>')
+            marks.append(f'<polygon class="band{cls}" points="{upper} {lower}"/>')
         if len(run) > 1:
             line = " ".join(f"{axis.mid(b.start):.1f},{_y(b.mean, ticks):.1f}" for b in run)
-            marks.append(f'<polyline class="line" points="{line}"/>')
+            marks.append(f'<polyline class="line{cls}" points="{line}"/>')
     small = len(pts) <= 60
     # isolated points (no neighbour to draw a line to) always get a marker
-    isolated = {run[0].start for run in _runs(axis, pts) if len(run) == 1}
-    for b in pts:
-        if small or b.start in isolated:
-            marks.append(f'<circle class="dot" cx="{axis.mid(b.start):.1f}" '
-                         f'cy="{_y(b.mean, ticks):.1f}" r="{4 if small else 2.5}"/>')
-        period = fmt_period(b.start, axis.unit)
+    isolated = {run[0].start for run in runs if len(run) == 1}
+    r = dot_r if dot_r is not None else 4 if small else 2.5
+    marks.extend(f'<circle class="dot{cls}" cx="{axis.mid(b.start):.1f}" '
+                 f'cy="{_y(b.mean, ticks):.1f}" r="{r}"/>'
+                 for b in pts if small or b.start in isolated)
+    return marks
+
+
+def line_panel(axis: TimeAxis, label: str, note: str, buckets: list[Bucket], band: bool,
+               pct: bool, show_x: bool, info: str = "", unit: str = "",
+               prev: list[Bucket] | None = None, prev_key: str = "") -> str:
+    """A line chart of the period means (with their interquartile range if ``band``).
+
+    ``prev`` (the same series in the bundle of ``prev_key``, on the same kind of
+    periods) is drawn behind it, de-emphasized in the colour of changes.
+    """
+    pts = [b for b in buckets if b.mean is not None]
+    if not pts:
+        return ""
+    ppts = [b for b in prev or [] if b.mean is not None]
+    lows = [b.q25 if band and b.q25 is not None else b.mean for b in pts + ppts]
+    highs = [b.q75 if band and b.q75 is not None else b.mean for b in pts + ppts]
+    lo, hi = min(lows), max(highs)
+    if pct:
+        lo, hi = min(0.0, lo), max(1.0, hi)
+    ticks = nice_ticks(lo, hi)
+    marks = _line_marks(axis, ppts, ticks, band, " prev", 2) if ppts else []
+    marks += _line_marks(axis, pts, ticks, band)
+    u = f" {unit}" if unit else ""
+
+    def describe(b: Bucket) -> str:
         if pct:
-            tip = f"{period}: mean adherence {fmt_pct(b.mean)} (n={b.n:,})"
-        else:
-            u = f" {unit}" if unit else ""
-            tip = (f"{period}: mean {fmt_num(b.mean)}{u} · IQR {fmt_num(b.q25)}–"
-                   f"{fmt_num(b.q75)}{u} · range {fmt_num(b.min)}–{fmt_num(b.max)}{u} · "
-                   f"n={b.n:,}")
+            return f"mean adherence {fmt_pct(b.mean)} (n={b.n:,})"
+        return (f"mean {fmt_num(b.mean)}{u} · IQR {fmt_num(b.q25)}–{fmt_num(b.q75)}{u} · "
+                f"range {fmt_num(b.min)}–{fmt_num(b.max)}{u} · n={b.n:,}")
+
+    before = {b.start: b for b in ppts}
+    hits = []
+    for b in pts:
+        tip = f"{fmt_period(b.start, axis.unit)}: {describe(b)}"
+        if prev is not None:
+            pb = before.pop(b.start, None)
+            tip += f"\n{prev_key}: " + (describe(pb) if pb else "no values")
         hits.append(_hit(axis, b, tip))
+    for pb in before.values():  # periods with values in the preceding bundle only
+        hits.append(_hit(axis, pb, f"{fmt_period(pb.start, axis.unit)}: no values\n"
+                                   f"{prev_key}: {describe(pb)}"))
     return _panel(axis, label, note, ticks, pct, marks, hits, show_x, info, unit)
 
 
@@ -1223,15 +1468,29 @@ def result_problem(view: QIView, unit: str) -> str | None:
 
 
 def qi_block(d: DatasetData, view: QIView, heading: str, block_id: str,
-             subtitle: str = "") -> str:
+             subtitle: str = "", prev_key: str | None = None,
+             prev_view: QIView | None = None, prev_unit: str | None = None) -> str:
     """Charts and tables of one QI in one dataset.
 
     The debug panels sit in a collapsible block that starts expanded when the
     QI result looks broken (see ``result_problem``). Result and debug panels
     share one time axis, and each group carries its own x-axis labels so that
     either reads on its own.
+
+    With ``prev_key`` (the dataset is in the preceding bundle), the totals show how
+    they changed since that bundle, where ``prev_view`` is the QI (None: it had none).
+    If that bundle's dataset has the same kind of periods (``prev_unit``), its debug
+    values are drawn behind the current ones.
     """
-    all_series = ([view.result[1]] if view.result else []) + [s for _, s in view.debug]
+    # debug series of the preceding bundle, by concept, to draw behind the current ones
+    prev_debug: dict[int, Series] = {}
+    if prev_key and prev_view and prev_unit == d.unit:
+        prev_debug = {c.concept_id: s for c, s in prev_view.debug
+                      if any(c2.concept_id == c.concept_id for c2, _ in view.debug)}
+    prev_result = (prev_view.result[1] if prev_key and prev_view and prev_view.result
+                   and view.result and prev_unit == d.unit else None)
+    all_series = (([view.result[1]] if view.result else []) + [s for _, s in view.debug]
+                  + list(prev_debug.values()) + ([prev_result] if prev_result else []))
     starts = [b.start for s in all_series for b in s.buckets]
     axis = TimeAxis(d.unit, starts)
     unit = UNIT_LABEL[d.unit]
@@ -1242,19 +1501,32 @@ def qi_block(d: DatasetData, view: QIView, heading: str, block_id: str,
     if view.result:
         concept, series = view.result
         periods = len(series.buckets)
-        meta.append(f"<b>{fmt_int(series.n)}</b> patient-days in the initial population "
+        prev = prev_view.result[1] if prev_view and prev_view.result else None
+        dn = dm = ""
+        if prev_key:
+            dn = delta_html(series.n, prev and prev.n, "int", prev_key)
+            dm = delta_html(series.mean, prev and prev.mean, "pct", prev_key)
+        meta.append(f"<b>{fmt_int(series.n)}</b>{dn} patient-days in the initial population "
                     f"over {periods} {unit}{'s' if periods != 1 else ''}")
-        meta.append(f"mean adherence <b>{fmt_pct(series.mean)}</b>")
+        meta.append(f"mean adherence <b>{fmt_pct(series.mean)}</b>{dm}")
+        pb = prev_result.buckets if prev_result else None
         result_items.append(lambda x, s=series: bars_panel(
-            axis, "Initial population", f"patient-days per {unit}", s.buckets, x))
+            axis, "Initial population", f"patient-days per {unit}", s.buckets, x,
+            pb, prev_key or ""))
         if _has_means(series):
             result_items.append(lambda x, s=series: line_panel(
-                axis, "Adherence", f"mean per {unit}", s.buckets, False, True, x))
+                axis, "Adherence", f"mean per {unit}", s.buckets, False, True, x, "", "",
+                pb, prev_key or ""))
+        if prev_result:
+            meta.append(f'<span class="prev-key">{esc(prev_key)}</span> drawn faintly in '
+                        "the charts")
     debug = [(c, s) for c, s in view.debug if _has_means(s)]
     debug_items: list[Callable[[bool], str]] = [
         lambda x, c=c, s=s: line_panel(
             axis, c.short_name, f"OMOP:{c.concept_id} · n={s.n:,}", s.buckets,
-            True, False, x, concept_info(c), c.unit)
+            True, False, x, concept_info(c), c.unit,
+            prev_debug[c.concept_id].buckets if c.concept_id in prev_debug else None,
+            prev_key or "")
         for c, s in debug]
 
     def render(items: list[Callable[[bool], str]]) -> str:
@@ -1263,6 +1535,9 @@ def qi_block(d: DatasetData, view: QIView, heading: str, block_id: str,
     parts = [render(result_items)]
     if debug_items:
         why = " · expanded because the QI result looks broken" if problem else ""
+        if prev_debug:
+            why += (f' · <span class="prev-key">{esc(prev_key)}</span> drawn behind, where '
+                    "it had values")
         parts.append(f"""<details class="debug"{" open" if problem else ""}>
   <summary>Debug values <span class="dim">— {len(debug_items)} quantit{"y" if len(debug_items) == 1 else "ies"},
     mean per {unit}, band = interquartile range, each with its own scale{why}</span></summary>
@@ -1380,8 +1655,10 @@ def run_problem(d: DatasetData) -> bool:
     return d.log is not None and bool(d.log.error or d.log.failures)
 
 
-def run_section(d: DatasetData) -> str:
-    """Run time, patient counts and message frequencies from the dataset's run log."""
+def run_section(d: DatasetData, prev_key: str | None = None,
+                p: DatasetData | None = None) -> str:
+    """Run time, patient counts and message frequencies from the dataset's run log; with
+    the changes since dataset ``p`` of the bundle of ``prev_key``, if it has a run log."""
     head = '<section class="block" id="s-run"><h2>Evaluation run</h2>'
     if d.log is None:
         where = (f"no run log at {esc(d.log_path)}" if d.log_path
@@ -1392,14 +1669,24 @@ def run_section(d: DatasetData) -> str:
     parts = [head, f'<p class="meta">{esc(lg.path)}{started}</p>']
     if lg.error:
         parts.append(f'<p class="banner warn">{RUN_SIGN} {esc(lg.error)}</p>')
+    plg = p.log if p is not None and p.log is not None and p.log.seconds is not None else None
+
+    def chg(attr: str, kind: str, value=None) -> str:
+        if plg is None:
+            return ""
+        new = getattr(lg, attr) if value is None else value
+        return delta_html(new, getattr(plg, attr), kind, prev_key)
+
     if lg.seconds is not None:
         fail_cls = " problem-text" if lg.failures else ""
         fail_v = f"{RUN_SIGN} {fmt_int(lg.failures)}" if lg.failures else fmt_int(lg.failures)
-        tiles = [("Time taken", fmt_duration(lg.seconds), f"{lg.seconds:,.3f} s", ""),
-                 ("Patients processed", fmt_int(lg.patients), "successes + failures", ""),
-                 ("Successes", fmt_int(lg.successes), "", ""),
-                 ("Failures", fail_v, "", fail_cls),
-                 ("Warnings", fmt_int(lg.warnings_total),
+        tiles = [("Time taken", fmt_duration(lg.seconds) + chg("seconds", "dur"),
+                  f"{lg.seconds:,.3f} s", ""),
+                 ("Patients processed", fmt_int(lg.patients) + chg("patients", "int"),
+                  "successes + failures", ""),
+                 ("Successes", fmt_int(lg.successes) + chg("successes", "int"), "", ""),
+                 ("Failures", fail_v + chg("failures", "int"), "", fail_cls),
+                 ("Warnings", fmt_int(lg.warnings_total) + chg("warnings_total", "int"),
                   f"{fmt_rate(lg.warnings_total or 0, lg.patients)} per 1,000 patients · "
                   f"{len(lg.warnings)} kind(s)", "")]
         parts.append('<div class="tiles">' + "".join(
@@ -1407,12 +1694,21 @@ def run_section(d: DatasetData) -> str:
             f'<div class="sub">{esc(sub)}</div></div>' for k, v, sub, cls in tiles) + "</div>")
     if lg.warnings:
         total = lg.warnings_total or sum(w.count for w in lg.warnings)
+        before = {warning_kind(w): w.count for w in plg.warnings} if plg else {}
+
+        def change(w: LogWarning) -> str:
+            if plg is None:
+                return ""
+            dt = delta_html(w.count, before.get(warning_kind(w)), "int", prev_key)
+            return f'<td class="chg">{dt}</td>'
+
         rows = "".join(
-            f'<tr><td>{fmt_int(w.count)}</td><td>{fmt_rate(w.count, lg.patients)}</td>'
+            f'<tr><td>{fmt_int(w.count)}</td>{change(w)}<td>{fmt_rate(w.count, lg.patients)}</td>'
             f'<td>{fmt_pct(w.count / total if total else None)}</td><td class="lvl">{esc(w.level)}</td><td class="msg">{esc(w.message)}</td></tr>'
             for w in lg.warnings)
+        change_th = f'<th title="since {esc(prev_key)}">Change</th>' if plg else ""
         parts.append(f"""<div class="tablewrap"><table class="stats num msgs">
-  <thead><tr><th>Count</th><th>Per 1,000 patients</th><th>Share</th><th>Level</th>
+  <thead><tr><th>Count</th>{change_th}<th>Per 1,000 patients</th><th>Share</th><th>Level</th>
     <th>Message (example)</th></tr></thead>
   <tbody>{rows}</tbody></table></div>
 <p class="meta">Each row is one kind of warning; the engine shows the first message of that
@@ -1429,7 +1725,7 @@ def run_section(d: DatasetData) -> str:
     return "\n".join(parts)
 
 
-def profile_section(d: DatasetData) -> str:
+def profile_section(d: DatasetData, base: str = "") -> str:
     """The run's flamegraph, collapsed; the SVG is fetched when the section is opened."""
     head = '<section class="block" id="s-profile"><h2>Profile</h2>'
     pf = d.profile
@@ -1452,7 +1748,7 @@ def profile_section(d: DatasetData) -> str:
     <span class="meta">Hover a frame for its name and time; click it to zoom to it.
       Times are summed over all patients, so they may exceed the run's time taken.</span>
   </div>
-  <div class="flamewrap" data-src="/profile/{quote(d.name, safe='')}">Loading…</div>
+  <div class="flamewrap" data-src="{base}/profile/{quote(d.name, safe='')}">Loading…</div>
 </details></section>"""
 
 
@@ -1463,6 +1759,199 @@ def unknown_note(d: DatasetData, concepts: dict[int, Concept]) -> str:
     items = ", ".join(f"{cid} ({n:,} values)" for cid, n in unknown)
     return (f'<p class="banner warn">⚠️ {len(unknown)} concept id(s) in the data are not '
             f'listed in the concepts files and are not shown: {esc(items)}</p>')
+
+
+# ==========================================================================
+# Differences from the preceding result bundle
+
+#: how values of each kind are shown; two values differ if they are shown differently
+_DELTA_FMT: dict[str, Callable] = {"int": fmt_int, "pct": fmt_pct, "dur": fmt_duration,
+                                   "num": fmt_num, "text": lambda v: "—" if v is None else str(v)}
+
+
+def differs(new, old, kind: str) -> bool:
+    return _DELTA_FMT[kind](new) != _DELTA_FMT[kind](old)
+
+
+def delta_text(new, old, kind: str) -> str:
+    """The change from ``old`` to ``new`` in words, e.g. "+1,234 (+3.2 %)" or "-1.5 pp"."""
+    if old is None:
+        return "new"
+    if new is None:
+        return "gone"
+    if kind == "text":
+        return "changed"
+    d = new - old
+    if kind == "pct":
+        return f"{d * 100:+.1f} pp"
+    rel = f" ({d / old:+.1%})" if old else ""
+    sign = "+" if d >= 0 else "-"
+    if kind == "int":
+        return f"{d:+,}{rel}"
+    if kind == "dur":
+        return f"{sign}{fmt_duration(abs(d))}{rel}"
+    return f"{sign}{fmt_num(abs(d))}{rel}"
+
+
+def delta_html(new, old, kind: str, prev_key: str) -> str:
+    """A small change marker for ``new``, or "" if it is shown as before."""
+    if not differs(new, old, kind):
+        return ""
+    tip = f"{prev_key}: {_DELTA_FMT[kind](old)}"
+    return f'<span class="delta" title="{esc(tip)}">{esc(delta_text(new, old, kind))}</span>'
+
+
+#: digits (and the numbers, dates and times they make up) in a warning message: the
+#: engine prints an example message per kind, so these differ from run to run
+_MESSAGE_NUMBERS = re.compile(r"\d[\d.,:T+-]*")
+
+
+def warning_kind(w: LogWarning) -> tuple[str, str]:
+    """What identifies a kind of warning across runs: its level and its message with the
+    numbers blanked out."""
+    return w.level, _MESSAGE_NUMBERS.sub("#", w.message)
+
+
+@dataclass
+class ChangeRow:
+    """One changed quantity of a dataset, compared with the preceding bundle."""
+
+    group: str  # "data", "run", "warnings" or a QI id
+    label: str  # HTML
+    old: str
+    new: str
+    delta: str  # e.g. "+3.2 %", "new", "gone"
+    #: debug values only: (old, new, delta) of the mean, while old/new/delta are of n
+    mean: tuple[str, str, str] | None = None
+
+
+def dataset_changes(d: DatasetData, p: DatasetData, concepts: dict[int, Concept]
+                    ) -> list[ChangeRow]:
+    """What differs between dataset ``d`` and the same dataset ``p`` of the preceding bundle."""
+    rows: list[ChangeRow] = []
+
+    def add(group: str, label: str, new, old, kind: str) -> None:
+        if differs(new, old, kind):
+            f = _DELTA_FMT[kind]
+            rows.append(ChangeRow(group, label, f(old), f(new), delta_text(new, old, kind)))
+
+    add("data", "Could not be loaded", d.error, p.error, "text")
+    if not (d.error or p.error):
+        add("data", "Rows", d.rows, p.rows, "int")
+        add("data", "First date", d.first, p.first, "text")
+        add("data", "Last date", d.last, p.last, "text")
+        add("data", "Binned by", d.unit, p.unit, "text")
+
+    lg, plg = d.log, p.log
+    add("run", "Run log", "present" if lg else None, "present" if plg else None, "text")
+    if lg and plg:
+        add("run", "Log problem", lg.error, plg.error, "text")
+    # an unfinished run (no summary) has no totals: the log problem says enough then
+    if lg and plg and lg.seconds is not None and plg.seconds is not None:
+        add("run", "Time taken", lg.seconds, plg.seconds, "dur")
+        add("run", "Patients processed", lg.patients, plg.patients, "int")
+        add("run", "Failures", lg.failures, plg.failures, "int")
+        add("run", "Warnings", lg.warnings_total, plg.warnings_total, "int")
+        old = {warning_kind(w): w for w in plg.warnings}
+        new = {warning_kind(w): w for w in lg.warnings}
+        for k in sorted(new.keys() | old.keys(),
+                        key=lambda k: -(new[k].count if k in new else old[k].count)):
+            w = new.get(k) or old[k]
+            label = f'<span class="lvl">{esc(w.level)}</span> {esc(w.message)}'
+            add("warnings", label, new[k].count if k in new else None,
+                old[k].count if k in old else None, "int")
+    pf, ppf = d.profile, p.profile
+    if pf and ppf and pf.total_ms and ppf.total_ms:
+        add("run", "Profile: evaluation time", pf.total_ms / 1000, ppf.total_ms / 1000, "dur")
+
+    if d.error or p.error:
+        return rows
+    views, pviews = qi_views(d, concepts), qi_views(p, concepts)
+    for qi in sorted(views.keys() | pviews.keys()):
+        v, pv = views.get(qi), pviews.get(qi)
+        r = v.result[1] if v and v.result else None
+        pr = pv.result[1] if pv and pv.result else None
+        add(qi, "Patient-days", r.n if r else None, pr.n if pr else None, "int")
+        add(qi, "Mean adherence", r.mean if r else None, pr.mean if pr else None, "pct")
+        add(qi, "Periods", len(r.buckets) if r else None, len(pr.buckets) if pr else None,
+            "int")
+        debug = {c.concept_id: (c, s) for c, s in (v.debug if v else [])}
+        pdebug = {c.concept_id: (c, s) for c, s in (pv.debug if pv else [])}
+        for cid in sorted(debug.keys() | pdebug.keys()):
+            c, s = debug.get(cid) or (pdebug[cid][0], None)
+            ps = pdebug[cid][1] if cid in pdebug else None
+            n, pn = (s.n if s else None), (ps.n if ps else None)
+            mean, pmean = (s.mean if s else None), (ps.mean if ps else None)
+            if differs(n, pn, "int") or differs(mean, pmean, "num"):
+                # one row for both: an unchanged aspect is shown without a change
+                def triple(new, old, kind: str) -> tuple[str, str, str]:
+                    return (_DELTA_FMT[kind](old), _DELTA_FMT[kind](new),
+                            delta_text(new, old, kind) if differs(new, old, kind) else "")
+                rows.append(ChangeRow(qi, f"{esc(c.short_name)}{unit_html(c.unit)}",
+                                      *triple(n, pn, "int"), mean=triple(mean, pmean, "num")))
+    return rows
+
+
+def changes_table(rows: list[ChangeRow], prev_key: str, key: str,
+                  heading: Callable[[str], str]) -> str:
+    """The changes of one dataset, grouped under ``heading(group)``.
+
+    Debug values take one row each, with columns for both their count (n) and mean,
+    under a sub-heading of their own in their QI's group.
+    """
+    wide = any(r.mean is not None for r in rows)
+    cols = 7 if wide else 4
+    pad = '<td colspan="3"></td>' if wide else ""
+
+    def cells(old: str, new: str, delta: str, cls: str = "") -> str:
+        return (f"<td{cls}>{esc(old)}</td><td>{esc(new)}</td>"
+                f'<td class="chg">{esc(delta)}</td>')
+
+    GRP = ' class="grp"'  # noqa: N806
+    out, group, in_debug = [], None, False
+    for r in rows:
+        if r.group != group:
+            group, in_debug = r.group, False
+            out.append(f'<tr class="group"><th colspan="{cols}">{heading(group)}</th></tr>')
+        if r.mean is None:
+            out.append(f'<tr><td class="what">{r.label}</td>{cells(r.old, r.new, r.delta)}'
+                       f"{pad}</tr>")
+            continue
+        if not in_debug:
+            in_debug = True
+            out.append('<tr class="sub"><td class="what">Debug values</td>'
+                       '<th colspan="3">n</th><th colspan="3" class="grp">Mean</th></tr>')
+        out.append(f'<tr><td class="what">{r.label}</td>{cells(r.old, r.new, r.delta)}'
+                   f"{cells(*r.mean, cls=GRP)}</tr>")
+    dates = f"<th>{esc(prev_key)}</th><th>{esc(key)}</th><th>Change</th>"
+    more = (f'<th class="grp">{esc(prev_key)}</th><th>{esc(key)}</th><th>Change</th>'
+            if wide else "")
+    return f"""<div class="tablewrap"><table class="stats num changes">
+  <thead><tr><th></th>{dates}{more}</tr></thead>
+  <tbody>{"".join(out)}</tbody></table></div>"""
+
+
+def changes_summary(rows: list[ChangeRow], qi_link: Callable[[str], str]) -> str:
+    """One line per kind of change, for the overview."""
+    by_group: dict[str, list[ChangeRow]] = {}
+    for r in rows:
+        by_group.setdefault(r.group, []).append(r)
+    parts = []
+    for group, label in (("data", "Data"), ("run", "Run")):
+        if group in by_group:
+            items = ", ".join(f"{r.label} {esc(r.delta)}" for r in by_group[group])
+            parts.append(f'<span class="k">{label}:</span> {items}')
+    if ws := by_group.get("warnings"):
+        counts: dict[str, int] = {}
+        for r in ws:
+            k = r.delta if r.delta in ("new", "gone") else "changed"
+            counts[k] = counts.get(k, 0) + 1
+        items = ", ".join(f"{n} {k}" for k, n in counts.items() if n)
+        parts.append(f'<span class="k">Warning kinds:</span> {items}')
+    qis = [g for g in by_group if g not in ("data", "run", "warnings")]
+    if qis:
+        parts.append('<span class="k">QIs:</span> ' + ", ".join(qi_link(qi) for qi in qis))
+    return "<br>".join(parts)
 
 
 # ==========================================================================
@@ -1477,15 +1966,140 @@ class Page:
     current: str  # path of this page, to highlight it in the sidebar
 
 
+@dataclass
+class BundleContext:
+    """Which result bundle a report shows, among which, and the one it is compared with."""
+
+    key: str  # date of the bundle shown
+    dates: list[str]  # all bundles, oldest first
+    previous: str | None = None  # date of the bundle compared with
+    previous_store: DataStore | None = None
+    chosen: str | None = None  # the comparison chosen (a date or "none"); None: the preceding
+
+    @property
+    def preceding(self) -> str | None:
+        """The bundle preceding the one shown by date (the default comparison)."""
+        return Library.previous(self.key, self.dates)
+
+
 class Report:
-    def __init__(self, store: DataStore, catalog: ConceptCatalog, settings: Settings):
+    """The report of one set of datasets, made per request.
+
+    ``base`` prefixes every link (``/bundle/<date>`` in bundle mode, else empty; with a
+    chosen comparison ``/bundle/<date>/vs/<older date or none>``).
+    """
+
+    def __init__(self, store: DataStore | None, catalog: ConceptCatalog, settings: Settings,
+                 base: str = "", bundle: BundleContext | None = None):
         self.store = store
         self.catalog = catalog
         self.settings = settings
+        self.base = base
+        self.bundle = bundle
 
     @property
     def multi(self) -> bool:
-        return len(self.settings.datasets) > 1
+        return len(self.store.datasets or []) > 1
+
+    def url(self, path: str) -> str:
+        """Link to ``path`` (absolute within the report) in this report."""
+        return self.base + path
+
+    def _ds_url(self, name: str) -> str:
+        return self.url("/dataset/" + quote(name, safe=""))
+
+    def _qi_url(self, qi: str) -> str:
+        return self.url("/qi/" + quote(qi, safe=""))
+
+    # -- the bundle compared with -------------------------------------------------
+
+    @property
+    def prev_key(self) -> str | None:
+        """Date of the bundle compared with, if there is one (and it is loaded)."""
+        b = self.bundle
+        return b.previous if b and b.previous_store and b.previous_store.datasets is not None else None
+
+    def _prev(self, name: str) -> DatasetData | None:
+        """Dataset ``name`` of the bundle compared with."""
+        if not self.prev_key:
+            return None
+        return next((p for p in self.bundle.previous_store.datasets if p.name == name), None)
+
+    def _prev_views(self, name: str, concepts: dict[int, Concept]) -> dict[str, QIView] | None:
+        """The QIs of dataset ``name`` in the bundle compared with; None if it is not there
+        (or could not be loaded), so that there is nothing to compare with."""
+        p = self._prev(name)
+        return qi_views(p, concepts) if p is not None and not p.error else None
+
+    def _prev_url(self, path: str) -> str:
+        return f"/bundle/{self.prev_key}{path}"
+
+    def _changes_note(self) -> str:
+        which = ("the preceding bundle, of" if self.prev_key == self.bundle.preceding
+                 else "the bundle of")
+        return (f'<p class="meta">Compared with {which} '
+                f'<a href="{self._prev_url("/")}">{esc(self.prev_key)}</a> (choose another '
+                'in the sidebar). Values that are shown '
+                "the same in both are not listed; hover a change for the value before.</p>")
+
+    def _overview_changes(self, datasets: list[DatasetData], concepts: dict[int, Concept]
+                          ) -> str:
+        pk = self.prev_key
+        names = {d.name for d in datasets}
+        rows = []
+        for d in datasets:
+            link = f'<a href="{self._ds_url(d.name)}#s-changes">{esc(d.name)}</a>'
+            p = self._prev(d.name)
+            if p is None:
+                rows.append(f'<tr><th>{link}</th><td class="chg">new in this bundle</td></tr>')
+                continue
+            changes = dataset_changes(d, p, concepts)
+            summary = (changes_summary(changes, lambda qi, d=d: (
+                f'<a href="{self._ds_url(d.name)}#{anchor(qi)}">{esc(qi)}</a>'))
+                       if changes else '<span class="dim">no changes</span>')
+            rows.append(f"<tr><th>{link}</th><td>{summary}</td></tr>")
+        for p in self.bundle.previous_store.datasets:
+            if p.name not in names:
+                rows.append(f'<tr><th><a href="{self._prev_url("/dataset/" + quote(p.name, safe=""))}">'
+                            f'{esc(p.name)}</a></th><td class="chg">gone: not in this bundle'
+                            "</td></tr>")
+        return f"""<section class="block" id="s-changes">
+  <h2>Changes since {esc(pk)}</h2>
+  {self._changes_note()}
+  <div class="tablewrap"><table class="stats changes-summary"><tbody>{"".join(rows)}</tbody>
+  </table></div>
+</section>"""
+
+    def _dataset_changes(self, d: DatasetData, concepts: dict[int, Concept],
+                         info: dict[str, QIInfo]) -> str:
+        pk = self.prev_key
+        head = f'<section class="block" id="s-changes"><h2>Changes since {esc(pk)}</h2>'
+        p = self._prev(d.name)
+        if p is None:
+            return (f'{head}<p class="meta">New in this bundle: the bundle of '
+                    f'<a href="{self._prev_url("/")}">{esc(pk)}</a> has no {esc(d.name)}.'
+                    "</p></section>")
+        changes = dataset_changes(d, p, concepts)
+        if not changes:
+            return (f'{head}<p class="meta">No changes since the bundle of '
+                    f'<a href="{self._prev_url(self._ds_url(d.name).removeprefix(self.base))}">'
+                    f"{esc(pk)}</a>.</p></section>")
+        groups = {"data": "Data", "run": "Evaluation run",
+                  "warnings": "Warning kinds (count)"}
+
+        def heading(group: str) -> str:
+            if group in groups:
+                return groups[group]
+            return f'<a href="#{anchor(group)}">{qi_heading(group, info)}</a>'
+
+        n = len(changes)
+        return f"""<section class="block" id="s-changes">
+<details class="changes">
+  <summary><h2>Changes since {esc(pk)}</h2>
+    <span class="dim">— {n} changed value{"s" if n != 1 else ""}</span></summary>
+  {self._changes_note()}
+  {changes_table(changes, pk, self.bundle.key, heading)}
+</details></section>"""
 
     # -- routing --------------------------------------------------------------
 
@@ -1497,36 +2111,65 @@ class Report:
         return HTTPStatus.OK, d.profile.svg
 
     def render(self, path: str) -> tuple[HTTPStatus, str]:
+        """The page at ``path`` (below ``base``)."""
         datasets = self.store.datasets
-        if datasets is None:
+        prev = self.bundle.previous_store if self.bundle else None
+        if datasets is None or (prev is not None and prev.datasets is None):
             return HTTPStatus.OK, self._loading_page()
         concepts = self.catalog.get()
         info = self.catalog.qi_info()
         parts = [unquote(p) for p in path.strip("/").split("/") if p]
+        current = self.url(path)
         page: Page | None = None
         if not parts:
-            page = (self._overview(datasets, concepts, info) if self.multi
-                    else self._dataset_page(datasets[0], concepts, info, "/"))
+            if not datasets:
+                where = self.bundle and esc(self.settings.results_dir / self.bundle.key)
+                page = Page("No results", f"""<h1>{self._title()}</h1>
+<p class="banner warn">⚠️ There are no results-*.csv[.gz] files in {where}.</p>""",
+                            [], current)
+            elif self.multi:
+                page = self._overview(datasets, concepts, info, current)
+            else:
+                page = self._dataset_page(datasets[0], concepts, info, current)
         elif len(parts) == 2 and parts[0] == "dataset":
             d = next((d for d in datasets if d.name == parts[1]), None)
             if d is not None:
-                page = self._dataset_page(d, concepts, info, path)
+                page = self._dataset_page(d, concepts, info, current)
         elif len(parts) == 2 and parts[0] == "qi":
-            page = self._qi_page(parts[1], datasets, concepts, info, path)
+            page = self._qi_page(parts[1], datasets, concepts, info, current)
         if page is None:
+            where = f" in the bundle of {esc(self.bundle.key)}" if self.bundle else ""
             return HTTPStatus.NOT_FOUND, self._layout(
-                Page("Not found", '<h1>Not found</h1><p><a href="/">Back to the report</a></p>',
-                     [], ""), datasets, concepts, info)
+                Page("Not found", f'<h1>Not found{where}</h1><p><a href="{self.url("/")}">'
+                                  "Back to the report</a></p>", [], ""),
+                datasets, concepts, info)
         return HTTPStatus.OK, self._layout(page, datasets, concepts, info)
+
+    def no_bundles_page(self) -> str:
+        """Bundle mode with an empty results directory: just the upload form."""
+        body = f"""<h1>QI results</h1>
+<p class="banner info">There are no result bundles in {esc(self.settings.results_dir)} yet.
+  Upload one (<code>results-bundle-YYYY-MM-DD.tar.gz</code>) to get started.</p>
+{self._upload_form()}"""
+        return f"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QI report</title><style>{CSS}</style></head>
+<body class="loading"><main>{body}</main><div id="tip" role="tooltip" hidden></div>
+<script>{JS}</script></body></html>"""
+
+    def _title(self) -> str:
+        return f"QI results of {esc(self.bundle.key)}" if self.bundle else "QI results"
 
     # -- pages ------------------------------------------------------------------
 
     def _overview(self, datasets: list[DatasetData], concepts: dict[int, Concept],
-                  info: dict[str, QIInfo]) -> Page:
+                  info: dict[str, QIInfo], path: str) -> Page:
         views = {d.name: qi_views(d, concepts) for d in datasets if not d.error}
         qis = sorted({qi for v in views.values() for qi in v})
         ok = [d for d in datasets if not d.error]
-        head1 = "".join(f'<th colspan="2" class="grp"><a href="{_ds_url(d.name)}">'
+        pk = self.prev_key
+        pviews = {d.name: self._prev_views(d.name, concepts) for d in ok}
+        head1 = "".join(f'<th colspan="2" class="grp"><a href="{self._ds_url(d.name)}">'
                         f"{esc(d.name)}</a></th>" for d in ok)
         head2 = "".join("<th>Patient-days</th><th>Adherence</th>" for _ in ok)
         rows = []
@@ -1536,10 +2179,17 @@ class Report:
                 v = views[d.name].get(qi)
                 if v and v.result:
                     s = v.result[1]
-                    cells.append(f'<td class="grp">{fmt_int(s.n)}</td><td>{fmt_pct(s.mean)}</td>')
+                    dn = dm = ""
+                    if pviews[d.name] is not None:
+                        pv = pviews[d.name].get(qi)
+                        ps = pv.result[1] if pv and pv.result else None
+                        dn = delta_html(s.n, ps and ps.n, "int", pk)
+                        dm = delta_html(s.mean, ps and ps.mean, "pct", pk)
+                    cells.append(f'<td class="grp">{fmt_int(s.n)}{dn}</td>'
+                                 f'<td>{fmt_pct(s.mean)}{dm}</td>')
                 else:
                     cells.append('<td class="grp dim">—</td><td class="dim">—</td>')
-            rows.append(f'<tr><th><a href="{_qi_url(qi)}">{qi_heading(qi, info)}</a></th>'
+            rows.append(f'<tr><th><a href="{self._qi_url(qi)}">{qi_heading(qi, info)}</a></th>'
                         f'{"".join(cells)}</tr>')
         comparison = (f"""<div class="tablewrap"><table class="stats num">
   <thead><tr><th></th>{head1}</tr><tr><th>QI</th>{head2}</tr></thead>
@@ -1547,6 +2197,12 @@ class Report:
                       else '<p class="meta">No QI results in any dataset.</p>')
         def run_cells(d: DatasetData) -> str:
             lg = d.log
+            p = self._prev(d.name)
+            plg = p.log if p and p.log and p.log.seconds is not None else None
+
+            def chg(attr: str, kind: str) -> str:
+                return delta_html(getattr(lg, attr), getattr(plg, attr), kind, pk) if plg else ""
+
             if lg is None or lg.seconds is None:
                 why = ("no run log" if lg is None else lg.error or "")
                 if lg is None:
@@ -1555,18 +2211,29 @@ class Report:
                         f"{RUN_SIGN} run incomplete</td>")
             fail = (f'<td class="problem-text">{RUN_SIGN} {fmt_int(lg.failures)}</td>'
                     if lg.failures else f"<td>{fmt_int(lg.failures)}</td>")
-            return (f'<td class="grp" title="{lg.seconds:,.3f} s">{fmt_duration(lg.seconds)}</td>'
-                    f"<td>{fmt_int(lg.patients)}</td>{fail}<td>{fmt_int(lg.warnings_total)}</td>"
+            fail = fail.removesuffix("</td>") + chg("failures", "int") + "</td>"
+            return (f'<td class="grp" title="{lg.seconds:,.3f} s">{fmt_duration(lg.seconds)}'
+                    f'{chg("seconds", "dur")}</td>'
+                    f'<td>{fmt_int(lg.patients)}{chg("patients", "int")}</td>{fail}'
+                    f'<td>{fmt_int(lg.warnings_total)}{chg("warnings_total", "int")}</td>'
                     f"<td>{fmt_rate(lg.warnings_total or 0, lg.patients)}</td>")
 
+        def rows_delta(d: DatasetData) -> str:
+            p = self._prev(d.name)
+            return delta_html(d.rows, p.rows, "int", pk) if p and not p.error else ""
+
         ds_rows = "".join(
-            f'<tr><th><a href="{_ds_url(d.name)}">{esc(d.name)}</a></th>'
-            + (f'<td colspan="4" class="problem-text">⛔ {esc(d.error)}</td>' if d.error else
-               f"<td>{fmt_int(d.rows)}</td><td>{d.first} – {d.last}</td><td>{d.unit}</td>"
-               f'<td class="src">{esc(d.source)}</td>')
-            + run_cells(d) + "</tr>" for d in datasets)
-        body = f"""<h1>QI results — overview</h1>
+            f'<tr><th><a href="{self._ds_url(d.name)}">{esc(d.name)}</a></th>'
+            + (f'<td colspan="3" class="problem-text">⛔ {esc(d.error)}</td>' if d.error else
+               f"<td>{fmt_int(d.rows)}{rows_delta(d)}</td><td>{d.first} – {d.last}</td>"
+               f"<td>{d.unit}</td>")
+            # the source last: a long path would push the other columns out of view
+            + run_cells(d) + f'<td class="grp src">{esc(d.source)}</td></tr>'
+            for d in datasets)
+        changes = self._overview_changes(datasets, concepts) if pk else ""
+        body = f"""<h1>{self._title()} — overview</h1>
 {self._intro()}
+{changes}
 <section class="block" id="s-comparison">
   <h2>Cross-dataset comparison</h2>
   <p class="meta">Per QI and dataset: patient-days in the initial population and mean
@@ -1576,36 +2243,44 @@ class Report:
 <section class="block" id="s-datasets">
   <h2>Datasets</h2>
   <div class="tablewrap"><table class="stats">
-    <thead><tr><th></th><th colspan="4">QI results</th>
-      <th colspan="5" class="grp">Evaluation run (log)</th></tr>
-      <tr><th>Dataset</th><th>Rows</th><th>Dates</th><th>Binned by</th><th>Source</th>
+    <thead><tr><th></th><th colspan="3">QI results</th>
+      <th colspan="5" class="grp">Evaluation run (log)</th><th class="grp"></th></tr>
+      <tr><th>Dataset</th><th>Rows</th><th>Dates</th><th>Binned by</th>
       <th class="grp">Time taken</th><th>Patients</th><th>Failures</th><th>Warnings</th>
-      <th>Warnings / 1,000 patients</th></tr>
+      <th>Warnings / 1,000 patients</th><th class="grp">Source</th></tr>
     </thead>
     <tbody>{ds_rows}</tbody></table></div>
 </section>"""
-        return Page("Overview", body,
-                    [("s-comparison", "Cross-dataset comparison"), ("s-datasets", "Datasets")],
-                    "/")
+        toc = [("s-comparison", "Cross-dataset comparison"), ("s-datasets", "Datasets")]
+        if pk:
+            toc.insert(0, ("s-changes", f"Changes since {pk}"))
+        return Page("Overview", body, toc, path)
 
     def _dataset_page(self, d: DatasetData, concepts: dict[int, Concept],
                       info: dict[str, QIInfo], path: str) -> Page:
-        parts = [f"<h1>{esc(d.name)}</h1>", dataset_meta(d)]
+        title = f"{esc(d.name)} <span class=\"dim\">· {esc(self.bundle.key)}</span>" if self.bundle else esc(d.name)
+        parts = [f"<h1>{title}</h1>", dataset_meta(d)]
         toc = []
         if not self.multi:
             parts.append(self._intro())
-        parts.append(run_section(d))
+        pk = self.prev_key
+        p = self._prev(d.name)
+        if pk:
+            parts.append(self._dataset_changes(d, concepts, info))
+            toc.append(("s-changes", f"Changes since {pk}"))
+        parts.append(run_section(d, pk, p))
         toc.append(("s-run", f"Evaluation run {RUN_SIGN}" if run_problem(d) else "Evaluation run"))
-        parts.append(profile_section(d))
+        parts.append(profile_section(d, self.base))
         toc.append(("s-profile", "Profile"))
         if not d.error:
             parts.append(unknown_note(d, concepts))
             views = qi_views(d, concepts)
+            pviews = self._prev_views(d.name, concepts)
             # every QI of the concepts files, so that QIs without any data show up too
             known = {c.qi for c in concepts.values() if not c.debug}
             for qi in sorted(known | set(views)):
                 a = anchor(qi)
-                link = (f' <a class="xref" href="{_qi_url(qi)}">compare across datasets →</a>'
+                link = (f' <a class="xref" href="{self._qi_url(qi)}">compare across datasets →</a>'
                         if self.multi and qi in views else "")
                 view = views.get(qi)
                 heading, subtitle = qi_heading(qi, info), qi_subtitle(qi, info)
@@ -1613,7 +2288,10 @@ class Report:
                     parts.append(empty_qi_block(qi, heading, a, subtitle))
                     bad = True
                 else:
-                    parts.append(qi_block(d, view, f"{heading}{link}", a, subtitle))
+                    parts.append(qi_block(d, view, f"{heading}{link}", a, subtitle,
+                                          pk if pviews is not None else None,
+                                          pviews.get(qi) if pviews is not None else None,
+                                          p.unit if p is not None else None))
                     bad = result_problem(view, d.unit) is not None
                 label = qi_label(qi, info, short=True)
                 toc.append((a, f"{label} ⚠️" if bad else label))
@@ -1629,12 +2307,28 @@ class Report:
         known = any(c.qi == qi for c in concepts.values())
         if not found and not known:
             return None
-        rows = "".join(
-            f'<tr><th><a href="#{anchor(d.name)}">{esc(d.name)}</a></th>'
-            + (f"<td>{fmt_int(v.result[1].n)}</td><td>{len(v.result[1].buckets)} {d.unit}s</td>"
-               f"<td>{fmt_pct(v.result[1].mean)}</td>" if v.result
-               else '<td colspan="3" class="dim">debug values only</td>')
-            + "</tr>" for d, v in found)
+        pk = self.prev_key
+        # per dataset: whether the preceding bundle has it, and its view of this QI
+        prev: dict[str, tuple[bool, QIView | None]] = {}
+        for d, _ in found:
+            pviews = self._prev_views(d.name, concepts)
+            prev[d.name] = (pviews is not None, pviews.get(qi) if pviews is not None else None)
+
+        def summary_cells(d: DatasetData, v: QIView) -> str:
+            if not v.result:
+                return '<td colspan="3" class="dim">debug values only</td>'
+            s = v.result[1]
+            dn = dm = ""
+            had, pv = prev[d.name]
+            if had:
+                ps = pv.result[1] if pv and pv.result else None
+                dn = delta_html(s.n, ps and ps.n, "int", pk)
+                dm = delta_html(s.mean, ps and ps.mean, "pct", pk)
+            return (f"<td>{fmt_int(s.n)}{dn}</td><td>{len(s.buckets)} {d.unit}s</td>"
+                    f"<td>{fmt_pct(s.mean)}{dm}</td>")
+
+        rows = "".join(f'<tr><th><a href="#{anchor(d.name)}">{esc(d.name)}</a></th>'
+                       f"{summary_cells(d, v)}</tr>" for d, v in found)
         missing = [d.name for d in datasets if d.name not in {d2.name for d2, _ in found}]
         parts = [f"<h1>{qi_heading(qi, info)} across datasets</h1>", qi_subtitle(qi, info)]
         toc = []
@@ -1651,9 +2345,12 @@ class Report:
             parts.append(f'<p class="meta">No dataset has data for {esc(qi)}.</p>')
         for d, v in found:
             a = anchor(d.name)
-            heading = (f'{esc(d.name)} <a class="xref" href="{_ds_url(d.name)}#{anchor(qi)}">'
+            heading = (f'{esc(d.name)} <a class="xref" href="{self._ds_url(d.name)}#{anchor(qi)}">'
                        "dataset page →</a>")
-            parts.append(qi_block(d, v, heading, a))
+            had, pv = prev[d.name]
+            p = self._prev(d.name) if had else None
+            parts.append(qi_block(d, v, heading, a, "", pk if had else None, pv,
+                                  p.unit if p is not None else None))
             toc.append((a, d.name))
         return Page(f"{qi_label(qi, info)} across datasets", "\n".join(parts), toc, path)
 
@@ -1676,12 +2373,20 @@ class Report:
 </details>"""
 
     def _loading_page(self) -> str:
-        progress = esc(self.store.progress or "starting")
+        lines = []
+        if self.store.datasets is None:
+            what = f" of {esc(self.bundle.key)}" if self.bundle else ""
+            lines.append(f"Loading the QI results{what}: {esc(self.store.progress or 'starting')}.")
+        prev = self.bundle.previous_store if self.bundle else None
+        if prev is not None and prev.datasets is None:
+            lines.append(f"Loading the bundle of {esc(self.bundle.previous)} for the "
+                         f"comparison: {esc(prev.progress or 'waiting')}.")
+        text = "".join(f'<p class="meta">{line}</p>' for line in lines)
         return f"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
 <meta http-equiv="refresh" content="2"><title>Loading — QI report</title>
 <style>{CSS}</style></head>
 <body class="loading"><main><h1>Loading QI results…</h1>
-<p class="meta">Loading {progress}. This page refreshes automatically.</p></main></body></html>"""
+{text}<p class="meta">This page refreshes automatically.</p></main></body></html>"""
 
     # -- layout -----------------------------------------------------------------
 
@@ -1723,16 +2428,16 @@ class Report:
             return f'<ul class="toc">{items}</ul>'
 
         def entry(href: str, label: str, extra: str = "") -> str:
-            current = href == page.current or (href == "/" and page.current == "")
+            current = href == page.current
             cls = ' class="current"' if current else ""
             return (f'<li><a href="{href}"{cls}>{label}</a>{extra}'
                     f'{toc_html() if current else ""}</li>')
 
         sections = []
         if self.multi:
-            sections.append(f'<ul>{entry("/", "Overview")}</ul>')
+            sections.append(f'<ul>{entry(self.url("/"), "Overview")}</ul>')
             ds_items = "".join(
-                entry(_ds_url(d.name), esc(d.name),
+                entry(self._ds_url(d.name), esc(d.name),
                       ' <span class="problem-text" title="could not be loaded">⛔</span>'
                       if d.error else
                       f' <span title="the run log reports failures or is incomplete">{RUN_SIGN}</span>'
@@ -1740,31 +2445,66 @@ class Report:
                 for d in datasets)
             sections.append(f"<h3>Datasets</h3><ul>{ds_items}</ul>")
             qis = sorted({qi for d in datasets if not d.error for qi in qi_views(d, concepts)})
-            qi_items = "".join(entry(_qi_url(qi), esc(qi_label(qi, info, short=True)))
+            qi_items = "".join(entry(self._qi_url(qi), esc(qi_label(qi, info, short=True)))
                                for qi in qis)
             if qi_items:
                 sections.append(f"<h3>QIs across datasets</h3><ul>{qi_items}</ul>")
-        else:
+        elif datasets:
             d = datasets[0]
             sections.append(f'<h3>{esc(d.name)}</h3>{toc_html()}')
         loaded = self.store.loaded_at.strftime("%Y-%m-%d %H:%M") if self.store.loaded_at else "—"
         button = ('<button type="submit" disabled>Reloading…</button>' if self.store.loading
                   else '<button type="submit">Reload data</button>')
         return f"""<nav class="sidebar">
-  <div class="brand"><a href="/">QI report</a></div>
+  <div class="brand"><a href="{self.url("/")}">QI report</a></div>
+  {self._bundle_picker(page)}
   {"".join(sections)}
-  <form class="reload" method="post" action="/reload">
+  <form class="reload" method="post" action="{self.url("/reload")}">
     <span class="meta">data loaded {loaded}</span>{button}
   </form>
+  {self._upload_form() if self.bundle else ""}
 </nav>"""
 
+    def _bundle_picker(self, page: Page) -> str:
+        """Selects the bundle to show, staying on the same page if it exists there."""
+        b = self.bundle
+        if b is None:
+            return ""
+        options = "".join(
+            f'<option value="{esc(k)}"{" selected" if k == b.key else ""}>{esc(k)}'
+            f'{" (newest)" if k == b.dates[-1] else ""}</option>' for k in reversed(b.dates))
+        rest = page.current.removeprefix(self.base) or "/"
+        older = [k for k in reversed(b.dates) if k < b.key]
+        if older:
+            chosen = b.chosen or ""
+            vs_options = [("", f"preceding ({b.preceding})")]
+            vs_options += [(k, k) for k in older]
+            vs_options.append(("none", "nothing"))
+            vs = "".join(f'<option value="{esc(v)}"{" selected" if v == chosen else ""}>'
+                         f"{esc(label)}</option>" for v, label in vs_options)
+            link = (f'<span class="meta">show <a href="/bundle/{esc(b.previous)}{esc(rest)}">'
+                    f"{esc(b.previous)}</a></span>" if b.previous else "")
+            compare = f"""<label for="bundle-vs">Compared with</label>
+    <select id="bundle-vs" name="vs">{vs}</select>
+    {link}"""
+        else:
+            compare = '<span class="meta">the oldest bundle: nothing to compare with</span>'
+        return f"""<form class="bundle" method="get" action="/bundle">
+    <label for="bundle-date">Result bundle</label>
+    <select id="bundle-date" name="date">{options}</select>
+    {compare}
+    <input type="hidden" name="page" value="{esc(rest)}">
+    <noscript><button type="submit">Show</button></noscript>
+  </form>"""
 
-def _ds_url(name: str) -> str:
-    return "/dataset/" + quote(name, safe="")
-
-
-def _qi_url(qi: str) -> str:
-    return "/qi/" + quote(qi, safe="")
+    def _upload_form(self) -> str:
+        dates = esc(json.dumps(self.bundle.dates if self.bundle else []))
+        return f"""<form class="upload" data-dates="{dates}">
+    <label for="bundle-file">Upload a result bundle</label>
+    <input id="bundle-file" type="file" accept=".tar.gz,.tgz,.tar" required>
+    <button type="submit">Upload</button>
+    <span class="meta" aria-live="polite"></span>
+  </form>"""
 
 
 # ==========================================================================
@@ -1779,6 +2519,7 @@ CSS = """
   --axis: rgba(0,0,0,0.35); --hover: rgba(0,0,0,0.06);
   --problem-bg: #fdecea; --problem-border: #f5c6c0; --problem-text: #a8261b;
   --warn-bg: #fff7e0; --warn-border: #ecd9a0; --info-bg: #eef4fc; --info-border: #c9dbf3;
+  --change-bg: #f1eafb; --change-text: #6a3fb0;
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -1789,6 +2530,7 @@ CSS = """
     --axis: rgba(255,255,255,0.35); --hover: rgba(255,255,255,0.08);
     --problem-bg: #3a1f1c; --problem-border: #6b3029; --problem-text: #f19a90;
     --warn-bg: #352d14; --warn-border: #64552a; --info-bg: #1c2a3c; --info-border: #2f4866;
+    --change-bg: #2e2440; --change-text: #c4a8f0;
   }
 }
 * { box-sizing: border-box; }
@@ -1839,6 +2581,21 @@ nav button { font: inherit; font-size: 13px; padding: 5px 10px; border-radius: 6
              border: 1px solid var(--border); background: var(--surface); color: var(--text);
              cursor: pointer; }
 nav button:disabled { cursor: default; color: var(--text-3); }
+form.bundle, form.upload { display: flex; flex-direction: column; gap: 4px; margin: 4px 8px 6px; }
+form.upload { margin-top: 14px; }
+nav form.reload + form.upload { margin: 14px 8px 0; padding-top: 12px;
+                                border-top: 1px solid var(--border); }
+form.bundle label, form.upload label { font-size: 11.5px; text-transform: uppercase;
+  letter-spacing: .05em; color: var(--text-3); }
+form.bundle label[for=bundle-vs] { margin-top: 6px; }
+form.bundle select { font: inherit; font-size: 14px; padding: 4px 6px; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--surface); color: var(--text); }
+form.bundle .meta, form.upload .meta { margin: 0; font-size: 12.5px; }
+form.upload input[type=file] { font-size: 12.5px; max-width: 100%; }
+form.upload button { font: inherit; font-size: 13px; padding: 5px 10px; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--surface); color: var(--text);
+  cursor: pointer; align-self: flex-start; }
+form.upload .meta.err { color: var(--problem-text); }
 
 section.block { border-top: 1px solid var(--border); margin-top: 26px; padding-top: 14px; }
 h2 .xref { font-size: 13px; font-weight: normal; margin-left: 10px; }
@@ -1854,6 +2611,11 @@ figure.panel figcaption { font-size: 13px; font-weight: 600; }
         padding: 0 6px; border: 1px solid var(--border); border-radius: 4px; }
 figure.panel svg { display: block; width: 100%; height: auto; overflow: visible; }
 details.debug { margin-top: 16px; }
+details.changes > summary h2 { display: inline; }
+details.changes > summary .dim { font-size: 13px; }
+table.changes tr.sub td, table.changes tr.sub th { font-size: 12.5px; font-weight: 600;
+  color: var(--text-2); text-align: center; padding-top: 8px; }
+table.changes tr.sub td.what { text-align: left; }
 details.profile > summary { font-weight: 600; }
 .flamebar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 8px 0; }
 .flamebar button { font: inherit; font-size: 13px; padding: 3px 10px; border-radius: 6px;
@@ -1876,8 +2638,15 @@ svg .line { fill: none; stroke: var(--series); stroke-width: 2; stroke-linejoin:
 svg .band { fill: var(--band); }
 svg .dot { fill: var(--series); stroke: var(--surface); stroke-width: 1.5; }
 svg .hit { fill: transparent; }
+/* the preceding bundle's series, behind the current one */
+svg .line.prev { stroke: var(--change-text); stroke-width: 1.5; opacity: .55; }
+svg .band.prev { fill: var(--change-text); opacity: .12; }
+svg .dot.prev { fill: var(--change-text); stroke: none; opacity: .55; }
+svg .bar.prev { fill: var(--change-text); fill-opacity: .10; stroke: var(--change-text);
+                stroke-width: 1; stroke-opacity: .6; }
+.prev-key { color: var(--change-text); font-weight: 600; }
 svg .hit.on { fill: var(--hover); }
-#tip { position: fixed; z-index: 10; pointer-events: none; max-width: 420px;
+#tip { position: fixed; z-index: 10; pointer-events: none; max-width: 420px; white-space: pre-line;
        background: var(--text); color: var(--surface); font-size: 12.5px;
        padding: 5px 9px; border-radius: 6px; font-variant-numeric: tabular-nums; }
 
@@ -1899,6 +2668,17 @@ table.stats td.src { font-size: 12.5px; color: var(--text-2); }
 table.msgs td.lvl { text-align: left; font-size: 12px; color: var(--text-2); }
 table.msgs td.msg { text-align: left; white-space: normal; min-width: 40ch; }
 .tcap { font-size: 13px; font-weight: 600; margin: 12px 0 0; }
+.delta { display: inline-block; margin-left: 6px; padding: 0 5px; border-radius: 4px;
+         font-size: 11.5px; font-weight: 600; color: var(--change-text);
+         background: var(--change-bg); white-space: nowrap; cursor: help;
+         font-variant-numeric: tabular-nums; vertical-align: 1px; }
+.tile .v .delta { font-size: 12px; vertical-align: 3px; }
+table.stats td.chg { color: var(--change-text); font-weight: 600; }
+table.changes td.what { text-align: left; white-space: normal; min-width: 30ch; max-width: 70ch; }
+table.changes td.what .lvl { font-size: 12px; color: var(--text-2); }
+table.changes tr.group th { text-align: left; padding-top: 12px; font-size: 13.5px; }
+table.changes-summary td { white-space: normal; line-height: 1.6; }
+table.changes-summary .k { color: var(--text-3); }
 .chip { display: inline-block; font-size: 11px; font-weight: 600; color: var(--text-2);
         background: var(--hover); border-radius: 10px; padding: 0 7px; margin-left: 4px; }
 
@@ -1986,6 +2766,64 @@ JS = """
     }
   }, true);
 
+  // result bundles: the pickers switch on change; uploads go up as the raw archive
+  ['bundle-date', 'bundle-vs'].forEach(id => {
+    const pick = document.getElementById(id);
+    if (pick) pick.addEventListener('change', () => pick.form.submit());
+  });
+  document.querySelectorAll('form.upload').forEach(form => {
+    const input = form.querySelector('input[type=file]');
+    const button = form.querySelector('button');
+    const status = form.querySelector('.meta');
+    const say = (text, err) => { status.textContent = text; status.classList.toggle('err', !!err); };
+    function send(file, replace) {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', '/upload?name=' + encodeURIComponent(file.name) + (replace ? '&replace=1' : ''));
+      xhr.upload.onprogress = e => {
+        if (e.lengthComputable)
+          say(e.loaded < e.total ? `Uploading … ${Math.floor(100 * e.loaded / e.total)} %`
+                                 : 'Unpacking …');
+      };
+      xhr.onload = () => {
+        let reply = {};
+        try { reply = JSON.parse(xhr.responseText); } catch (err) { /* not JSON */ }
+        if (xhr.status === 200) {
+          say('Done' + (reply.skipped && reply.skipped.length
+                        ? ` (skipped: ${reply.skipped.join(', ')})` : '') + '.');
+          location.href = reply.url;
+        } else if (xhr.status === 409 && confirm(reply.error + '. Replace it?')) {
+          send(file, true);
+        } else {
+          button.disabled = false;
+          say('Upload failed: ' + (reply.error || xhr.statusText || 'HTTP ' + xhr.status), true);
+        }
+      };
+      xhr.onerror = () => { button.disabled = false; say('Upload failed: network error', true); };
+      button.disabled = true;
+      say('Uploading …');
+      xhr.send(file);
+    }
+    form.addEventListener('submit', e => {
+      e.preventDefault();
+      const file = input.files[0];
+      if (!file) return;
+      const m = file.name.match(/^results-bundle-(\\d{4}-\\d\\d-\\d\\d)\\.(?:tar\\.gz|tgz|tar)$/);
+      if (!m) { say('The file must be named results-bundle-YYYY-MM-DD.tar.gz', true); return; }
+      const exists = JSON.parse(form.dataset.dates || '[]').includes(m[1]);
+      if (exists && !confirm(`There is a bundle for ${m[1]} already. Replace it?`)) return;
+      send(file, exists);
+    });
+  });
+
+  // a link to a section (or into it) opens it if it is collapsed
+  function openTarget() {
+    const t = location.hash && document.getElementById(decodeURIComponent(location.hash.slice(1)));
+    const d = t && (t.querySelector(':scope > details.changes') || t.closest('details'));
+    if (d && !d.open) { d.open = true; t.scrollIntoView(); }
+  }
+  addEventListener('hashchange', openTarget);
+  openTarget();
+
   // sidebar table of contents follows the scroll position
   const links = [...document.querySelectorAll('nav ul.toc a[href^="#"]')];
   const targets = links.map(a => document.getElementById(decodeURIComponent(a.hash.slice(1))));
@@ -2016,22 +2854,95 @@ JS = """
 # HTTP server
 
 
+class App:
+    """What the server shows: fixed datasets, or the result bundles of a directory."""
+
+    def __init__(self, catalog: ConceptCatalog, settings: Settings):
+        self.catalog = catalog
+        self.settings = settings
+        self.library = Library(settings.results_dir) if settings.results_dir else None
+        self.store = None if self.library else DataStore(settings.datasets)
+
+    def start(self) -> None:
+        """Start loading what is shown first: the datasets, or the newest bundle (and the
+        one before it, for the comparison)."""
+        if self.store is not None:
+            self.store.reload()
+        elif dates := self.library.dates():
+            self.library.store(dates[-1])
+            if prev := Library.previous(dates[-1], dates):
+                self.library.store(prev)
+
+    def report(self, path: str) -> tuple[Report, str] | str | None:
+        """The report and the path within it for a request path; a path to redirect to;
+        or None for an unknown bundle."""
+        if self.store is not None:
+            return Report(self.store, self.catalog, self.settings), path
+        dates = self.library.dates()
+        if path in ("", "/"):
+            if not dates:
+                return Report(None, self.catalog, self.settings), ""
+            return f"/bundle/{dates[-1]}/"
+        m = re.fullmatch(r"/bundle/([^/]+)(?:/vs/([^/]+))?(/.*)?", path)
+        if not m or m[1] not in dates:
+            return None
+        key, chosen = m[1], m[2]
+        if chosen is not None and chosen != "none" and not (chosen in dates and chosen < key):
+            return None  # only older bundles can be compared with
+        base = f"/bundle/{key}" + (f"/vs/{chosen}" if chosen else "")
+        if m[3] is None:
+            return base + "/"
+        prev = (None if chosen == "none" else chosen) if chosen else Library.previous(key, dates)
+        ctx = BundleContext(key, dates, prev, self.library.store(prev) if prev else None, chosen)
+        return Report(self.library.store(key), self.catalog, self.settings, base, ctx), m[3]
+
+
 class Handler(BaseHTTPRequestHandler):
-    report: Report  # set on the subclass created in main()
+    app: App  # set on the subclass created in main()
     server_version = "qi-report"
 
     def do_GET(self) -> None:  # noqa: N802
-        path = urlsplit(self.path).path
+        url = urlsplit(self.path)
+        path = url.path
         if path == "/favicon.ico":
             self._send(HTTPStatus.NO_CONTENT, b"", "text/plain")
             return
-        if path.startswith("/profile/"):
-            status, svg = self.report.profile_svg(unquote(path.removeprefix("/profile/")))
-            self._send(status, svg.encode("utf-8"),
-                       "image/svg+xml" if status == HTTPStatus.OK else "text/plain")
+        if path == "/bundle" and self.app.library:  # the bundle picker's form
+            query = parse_qs(url.query)
+            key = (query.get("date") or [""])[0]
+            vs = (query.get("vs") or [""])[0]
+            page = (query.get("page") or ["/"])[0]
+            if not page.startswith("/") or page.startswith("//"):
+                page = "/"
+            # a comparison is kept only while it is older than the bundle shown
+            if vs and vs != "none" and not vs < key:
+                vs = ""
+            via = f"/vs/{quote(vs, safe='')}" if vs else ""
+            self._redirect(f"/bundle/{quote(key, safe='')}{via}{quote(page, safe='/')}")
             return
         try:
-            status, body = self.report.render(path)
+            found = self.app.report(path)
+            if isinstance(found, str):
+                self._redirect(found)
+                return
+            if found is None:
+                status = HTTPStatus.NOT_FOUND
+                body = ('<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">'
+                        f'<title>Not found — QI report</title><style>{CSS}</style></head>'
+                        '<body class="loading"><main><h1>Not found</h1>'
+                        '<p>There is no such result bundle. <a href="/">Show the newest '
+                        'one</a></p></main></body></html>')
+            else:
+                report, rest = found
+                if report.store is None:
+                    status, body = HTTPStatus.OK, report.no_bundles_page()
+                elif rest.startswith("/profile/"):
+                    status, svg = report.profile_svg(unquote(rest.removeprefix("/profile/")))
+                    self._send(status, svg.encode("utf-8"),
+                               "image/svg+xml" if status == HTTPStatus.OK else "text/plain")
+                    return
+                else:
+                    status, body = report.render(rest)
         except Exception:  # noqa: BLE001 — local tool: show the traceback
             log.exception("error rendering %s", path)
             status = HTTPStatus.INTERNAL_SERVER_ERROR
@@ -2039,14 +2950,52 @@ class Handler(BaseHTTPRequestHandler):
         self._send(status, body.encode("utf-8"), "text/html; charset=utf-8")
 
     def do_POST(self) -> None:  # noqa: N802
-        if urlsplit(self.path).path != "/reload":
+        url = urlsplit(self.path)
+        if url.path == "/upload" and self.app.library:
+            self._upload(parse_qs(url.query))
+            return
+        found = (self.app.report(url.path.removesuffix("reload"))
+                 if url.path.endswith("/reload") else None)
+        if not isinstance(found, tuple) or found[0].store is None:
             self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain")
             return
-        if self.report.store.reload():
+        report = found[0]
+        stores = [report.store]
+        if report.bundle and report.bundle.previous_store:
+            stores.append(report.bundle.previous_store)
+        if any([st.reload() for st in stores]):
             log.info("reload requested")
         referer = urlsplit(self.headers.get("Referer") or "/")
+        self._redirect(referer.path or "/")
+
+    def _upload(self, query: dict[str, list[str]]) -> None:
+        """Store an uploaded bundle: the raw archive is the request body, its file name
+        the ``name`` parameter; ``replace=1`` replaces a bundle of the same date."""
+        def reply(status: HTTPStatus, **data) -> None:
+            self._send(status, json.dumps(data).encode("utf-8"), "application/json")
+
+        name = (query.get("name") or [""])[0]
+        replace = (query.get("replace") or [""])[0] == "1"
+        try:
+            length = int(self.headers.get("Content-Length") or "")
+        except ValueError:
+            reply(HTTPStatus.LENGTH_REQUIRED, error="the upload has no Content-Length")
+            return
+        try:
+            key, skipped = self.app.library.add(name, self.rfile, length, replace)
+        except BundleError as e:
+            reply(e.status, error=str(e))
+            return
+        except OSError as e:
+            log.exception("cannot store the uploaded bundle %s", name)
+            self.close_connection = True
+            reply(HTTPStatus.INTERNAL_SERVER_ERROR, error=f"cannot store the bundle: {e}")
+            return
+        reply(HTTPStatus.OK, url=f"/bundle/{key}/", skipped=skipped)
+
+    def _redirect(self, location: str) -> None:
         self.send_response(HTTPStatus.SEE_OTHER)
-        self.send_header("Location", referer.path or "/")
+        self.send_header("Location", location)
         self.send_header("Content-Length", "0")
         self.end_headers()
 
@@ -2068,17 +3017,21 @@ def main(argv: list[str] | None = None) -> None:
     catalog.get()
     if catalog.error:
         raise SystemExit(f"error: {catalog.error}")
-    store = DataStore(settings.datasets)
-    store.reload()
-    handler = type("BoundHandler", (Handler,), {"report": Report(store, catalog, settings)})
+    app = App(catalog, settings)
+    app.start()
+    handler = type("BoundHandler", (Handler,), {"app": app})
     try:
         server = ThreadingHTTPServer((settings.host, settings.port), handler)
     except OSError as e:
         raise SystemExit(f"error: cannot listen on {settings.host}:{settings.port}: {e}") from e
     server.daemon_threads = True
     host = f"[{settings.host}]" if ":" in settings.host else settings.host
-    log.info("serving the QI report on http://%s:%d/ (%s source, %d dataset(s))",
-             host, settings.port, settings.source, len(settings.datasets))
+    if app.library:
+        what = (f"result bundles in {settings.results_dir} "
+                f"({len(app.library.dates())} so far)")
+    else:
+        what = f"{settings.source} source, {len(settings.datasets)} dataset(s)"
+    log.info("serving the QI report on http://%s:%d/ (%s)", host, settings.port, what)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
