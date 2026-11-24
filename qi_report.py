@@ -77,6 +77,8 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit
 import duckdb
 import yaml
 
+__version__ = '0.1.0'
+
 log = logging.getLogger("qi_report")
 
 #: column order the CQL engine writes into the results CSV files (no header)
